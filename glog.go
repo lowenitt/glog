@@ -540,7 +540,12 @@ func (l *loggingT) header(s severity, depth int) (*buffer, string, int) {
 	} else {
 		slash := strings.LastIndex(file, "/")
 		if slash >= 0 {
-			file = file[slash+1:]
+			slash2 := strings.LastIndex(file[:slash], "/")
+			if slash >= 0 {
+				file = file[slash2+1:]
+			} else {
+				file = file[slash+1:]
+			}
 		}
 	}
 	return l.formatHeader(s, file, line), file, line
@@ -646,6 +651,15 @@ func (l *loggingT) printDepth(s severity, depth int, args ...interface{}) {
 	l.output(s, buf, file, line, false)
 }
 
+func (l *loggingT) printDepthf(s severity, format string, depth int, args ...interface{}) {
+	buf, file, line := l.header(s, depth)
+	fmt.Fprintf(buf, format, args...)
+	if buf.Bytes()[buf.Len()-1] != '\n' {
+		buf.WriteByte('\n')
+	}
+	l.output(s, buf, file, line, false)
+}
+
 func (l *loggingT) printf(s severity, format string, args ...interface{}) {
 	buf, file, line := l.header(s, 0)
 	fmt.Fprintf(buf, format, args...)
@@ -676,10 +690,7 @@ func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoTo
 		}
 	}
 	data := buf.Bytes()
-	if !flag.Parsed() {
-		os.Stderr.Write([]byte("ERROR: logging before flag.Parse: "))
-		os.Stderr.Write(data)
-	} else if l.toStderr {
+	if l.toStderr {
 		os.Stderr.Write(data)
 	} else {
 		if alsoToStderr || l.alsoToStderr || s >= l.stderrThreshold.get() {
@@ -812,7 +823,7 @@ func (sb *syncBuffer) Sync() error {
 }
 
 func (sb *syncBuffer) Write(p []byte) (n int, err error) {
-	if sb.nbytes+uint64(len(p)) >= MaxSize {
+	if sb.nbytes+uint64(len(p)) >= MaxSize() {
 		if err := sb.rotateFile(time.Now()); err != nil {
 			sb.logger.exit(err)
 		}
@@ -1049,6 +1060,14 @@ func (v Verbose) Infof(format string, args ...interface{}) {
 	}
 }
 
+// InfoDepthf is equivalent to the global Infof function, guarded by the value of v.
+// See the documentation of V for usage.
+func (v Verbose) InfoDepthf(depth int, format string, args ...interface{}) {
+	if v {
+		logging.printDepthf(infoLog, format, depth, args...)
+	}
+}
+
 // Info logs to the INFO log.
 // Arguments are handled in the manner of fmt.Print; a newline is appended if missing.
 func Info(args ...interface{}) {
@@ -1059,6 +1078,12 @@ func Info(args ...interface{}) {
 // InfoDepth(0, "msg") is the same as Info("msg").
 func InfoDepth(depth int, args ...interface{}) {
 	logging.printDepth(infoLog, depth, args...)
+}
+
+// InfoDepthf acts as Info but uses depth to determine which call frame to log.
+// InfoDepthf(0, "msg") is the same as Infof("msg").
+func InfoDepthf(depth int, format string, args ...interface{}) {
+	logging.printDepthf(infoLog, format, depth, args...)
 }
 
 // Infoln logs to the INFO log.
