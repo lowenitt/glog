@@ -22,29 +22,178 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 // MaxSize is the maximum size of a log file in bytes.
-var MaxSize uint64 = 1024 * 1024 * 1800
+var maxSizeFlag = flag.Uint64("log_max_size", 500, "Max size (MB) per file.")
+var maxSize uint64 = 0
+
+func MaxSize() uint64 {
+	if maxSize == 0 {
+		maxSize = *maxSizeFlag * 1024 * 1024
+	}
+	return maxSize
+}
+
+// MaxNum is the maximum of log files for one thread.
+var maxNumFlag = flag.Int("log_max_num", 6, "Max num of file. The oldest will be removed if there is a extra file created.")
+
+func MaxNum() int {
+	return *maxNumFlag
+}
+
+// fileInfo contains log filename and its timestamp.
+type fileInfo struct {
+	name      string
+	timestamp string
+}
+
+// fileInfoList implements Interface interface in sort. For
+// sorting a list of fileInfo
+type fileInfoList []fileInfo
+
+func (b fileInfoList) Len() int           { return len(b) }
+func (b fileInfoList) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
+func (b fileInfoList) Less(i, j int) bool { return b[i].timestamp < b[j].timestamp }
+
+// fileBlock is a block of chain in logKeeper.
+type fileBlock struct {
+	fileInfo
+	next *fileBlock
+}
+
+// logKeeper maintains a chain of each level log file. Its head
+// is the earliest file while its tail is the oldest. It remains
+// up to MaxNum() files, and the extra added will lead to delete
+// the oldest. At first it load from logDir and take existing files
+// into the chain. And remove the part over MaxNum().
+type logKeeper struct {
+	dir      string
+	onceLoad sync.Once
+	head     map[string]*fileBlock
+	tail     map[string]*fileBlock
+	total    map[string]int
+}
+
+func (lk *logKeeper) add(tag string, newBlock *fileBlock) (ok bool) {
+	block, ok := lk.tail[tag]
+	if !ok {
+		return
+	}
+	if block == nil {
+		lk.head[tag] = newBlock
+	} else {
+		if block.name == newBlock.name {
+			return false
+		}
+		block.next = newBlock
+	}
+	lk.tail[tag] = newBlock
+	lk.total[tag]++
+	for lk.total[tag] > MaxNum() {
+		lk.remove(tag)
+	}
+	return
+}
+
+func (lk *logKeeper) remove(tag string) (ok bool) {
+	block, ok := lk.head[tag]
+	if !ok || lk.total[tag] == 0 {
+		return
+	}
+	lk.removeFile(block.name)
+	lk.head[tag] = block.next
+	block = nil // for GC
+	lk.total[tag]--
+	return
+}
+
+func (lk *logKeeper) removeFile(name string) error {
+	return os.Remove(filepath.Join(lk.dir, name))
+}
+
+func (lk *logKeeper) load() {
+	_dir, err := ioutil.ReadDir(lk.dir)
+	if err != nil {
+		return
+	}
+
+	reg := logNameReg()
+	tmp := make(map[string]fileInfoList)
+	for _, fi := range _dir {
+		if fi.IsDir() {
+			continue
+		}
+
+		result := reg.FindStringSubmatch(fi.Name())
+		if result == nil {
+			continue
+		}
+
+		name, tag, timestamp := result[0], result[1], result[2]
+		if tmp[tag] == nil {
+			tmp[tag] = make([]fileInfo, 0, len(_dir))
+		}
+		tmp[tag] = append(tmp[tag], fileInfo{name: name, timestamp: timestamp})
+	}
+
+	for tag, blockList := range tmp {
+		sort.Sort(blockList)
+		for i, block := range blockList {
+			if i < MaxNum() {
+				fb := &fileBlock{
+					fileInfo: fileInfo{name: block.name, timestamp: block.timestamp},
+					next:     nil,
+				}
+				if i == 0 {
+					lk.head[tag] = fb
+				} else {
+					lk.tail[tag].next = fb
+				}
+				lk.tail[tag] = fb
+				lk.total[tag]++
+			} else {
+				lk.removeFile(block.name)
+			}
+		}
+	}
+}
 
 // logDirs lists the candidate directories for new log files.
-var logDirs []string
+var logDirs []*logKeeper
 
 // If non-empty, overrides the choice of directory in which to write logs.
 // See createLogDirs for the full list of possible destinations.
 var logDir = flag.String("log_dir", "", "If non-empty, write log files in this directory")
 
 func createLogDirs() {
+	var dirs []string
 	if *logDir != "" {
-		logDirs = append(logDirs, *logDir)
+		dirs = append(dirs, *logDir)
 	}
-	logDirs = append(logDirs, os.TempDir())
+	dirs = append(dirs, os.TempDir())
+
+	for _, dir := range dirs {
+		head := make(map[string]*fileBlock)
+		tail := make(map[string]*fileBlock)
+		total := make(map[string]int)
+		for _, name := range severityName {
+			head[name] = nil
+			tail[name] = nil
+			total[name] = 0
+		}
+
+		logDirs = append(logDirs, &logKeeper{dir: dir, head: head, tail: tail, total: total})
+	}
 }
 
 var (
@@ -96,6 +245,14 @@ func logName(tag string, t time.Time) (name, link string) {
 	return name, program + "." + tag
 }
 
+// logNameReg returns a regexp object for match log file name.
+func logNameReg() *regexp.Regexp {
+	reg, _ := regexp.Compile(fmt.Sprintf(`^%s\..+\..+\.log.(%s)\.(\d{8}-\d{6})\.\d+$`,
+		program,
+		strings.Join(severityName, "|")))
+	return reg
+}
+
 var onceLogDirs sync.Once
 
 // create creates a new log file and returns the file and its filename, which
@@ -109,13 +266,15 @@ func create(tag string, t time.Time) (f *os.File, filename string, err error) {
 	}
 	name, link := logName(tag, t)
 	var lastErr error
-	for _, dir := range logDirs {
-		fname := filepath.Join(dir, name)
+	for _, lk := range logDirs {
+		lk.onceLoad.Do(lk.load)
+		fname := filepath.Join(lk.dir, name)
 		f, err := os.Create(fname)
 		if err == nil {
-			symlink := filepath.Join(dir, link)
+			symlink := filepath.Join(lk.dir, link)
 			os.Remove(symlink)        // ignore err
 			os.Symlink(name, symlink) // ignore err
+			lk.add(tag, &fileBlock{fileInfo: fileInfo{name: name, timestamp: ""}, next: nil})
 			return f, fname, nil
 		}
 		lastErr = err
